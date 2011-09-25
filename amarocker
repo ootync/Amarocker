@@ -1,0 +1,248 @@
+#!/bin/bash
+
+function display_help() {
+	cat <<-HELP
+			Tools to work with Amarok-starred collection items:
+				* List files & ratings, access Amarok's MySQL
+				* Export starred items to a media player, with mp3-convertion
+			Usage:
+				$(basename "$0") ls
+				$(basename "$0") ls-data
+				$(basename "$0") mysql
+				$(basename "$0") wrstats
+				$(basename "$0") copy <target>
+				$(basename "$0") conv <target> [<format:mp3>] [<sox mp3-quality:-2.2>]
+			(c) 09.2011 o_O Tync <ootync@gmail.com>, ICQ# 1227-700. Enjoy!
+			HELP
+	exit 0
+	}
+
+[ $# -lt 1 ] && display_help
+
+# Check binaries
+requires="mysql mysqld mysqladmin   rsync sox   eyeD3 mid3v2 metaflac vorbiscomment"
+which $requires > /dev/null
+[ $? -eq 0 ] || { echo "E: Required binaries are missing: $requires" >&2 ; exit 1 ; }
+
+#==========[ COMMON ]==========#
+
+### Exit with a code and a fatal error
+## $1	Exit code
+## ..	The string to print to stderr
+function fatal(){
+	local code="$1"
+	shift
+	echo "FATAL: $@" >&2
+	exit $code
+	}
+
+declare -a __atexit_traps
+function __atexit_trap(){
+	for i in "${__atexit_traps[@]}" ; do
+		eval $i
+		done
+	}
+function ATEXIT(){
+	local n=${#__atexit_traps[*]}
+	__atexit_traps[$n]="$*"
+	if [[ $n -eq 0 ]]; then
+		trap __atexit_trap EXIT
+		fi
+	}
+
+#==========[ ARGUMENTS ]==========#
+A_cmd="$1"
+shift 1
+
+#==========[ PREPARE ]==========#
+
+#=== Constants
+C_amarok="$HOME/.kde/share/apps/amarok/" # amarok database
+
+C_socket="/tmp/.amarockersock" # MySQL socket
+C_mysql_log="/tmp/.amarocker.mysql-log" # MySQL log
+
+C_filesdata="/tmp/.amarockerlist" # Rated files & ratings
+C_files="/tmp/.amarockerlist.names" # Rated files, list
+
+C_sox_format="mp3" # SOX output format
+C_sox_mp3q='-2.2' # SOX quality. `man soxformat`. Positive=CBR: <bitrate>.<quality>. Negative=VBR: <avg-bitrate: 1=256, 6=128>.<quality>
+
+#=== Launch MySQL daemon
+set -e
+mysqld --no-defaults \
+	--skip-grant-tables --innodb=OFF --read_only --skip-networking  \
+	--general_log --general_log_file="$C_mysql_log" --log-error="$C_mysql_log" \
+	--datadir="$C_amarok/mysqle" \
+	--socket="$C_socket" >/dev/null &
+set +e
+
+#=== Wait for MySQLd to start-up
+# Spin for a maximum of ten seconds waiting for the server to come up
+for x in {1..11}; do
+	[ $x -eq 11 ] && fatal 11 "MySQL daemon failed to start. Log: $C_mysql_log"
+	mysqladmin -S "$C_socket" ping 2>>"$C_mysql_log" >>"$C_mysql_log" && break 
+	sleep 1
+	done
+echo "amarocker: MySQL connection established after $x seconds" >> "$C_mysql_log"
+ATEXIT rm -f "$C_mysql_log"
+
+# Don't forget to kill it then
+ATEXIT mysqladmin -S "$C_socket" shutdown 2>/dev/null >/dev/null
+ATEXIT rm -f "$C_socket"
+
+#==========[ PROCESS ]==========#
+
+#=== Gather data
+cat <<-"SQL" | mysql -S "$C_socket" | tail -n +2 > "$C_filesdata"
+	USE amarok;
+	SELECT
+		`ur`.id							AS `id`,
+		`st`.rating						AS `fmps_rating`,
+		`st`.playcount					AS `fmps_playcount`,
+		COALESCE(`st`.score, 0)			AS `fmps_rating_amarok_score`,
+		CONCAT_WS('/', '', `ur`.rpath)	AS `path`
+	FROM
+		statistics `st`
+		LEFT JOIN urls `ur` ON(`st`.url=`ur`.id)
+	WHERE
+		`rating`>0 
+		AND `rpath` IS NOT NULL
+	;
+	SQL
+cat "$C_filesdata" | cut -f5- > "$C_files" # only filenames
+ATEXIT rm -f "$C_filesdata"
+ATEXIT rm -f "$C_files"
+
+function FAT32PREP(){
+	cat | tr '"*:<>?|' '________'
+	}
+
+#=== Commands
+case "$A_cmd" in
+	"ls") # List rated files & data
+		cat "$C_files"
+		;;
+	"ls-data") # List rated files & data
+		cat "$C_filesdata"
+		;;
+	"mysql") # Open MySQL console
+		mysql -ss -S "$C_socket"
+		;;
+	"wrstats") # Flush ratings into files
+		# ... Progress
+		files_total="$(cat "$C_filesdata" | wc -l)"
+		files_current=0
+		
+		function write_fmps_meta(){
+			local f="$1"
+			local f_ext="$2"
+			local f_rating="$3" # Rating
+			local f_pcount="$4" # Playcount
+			local f_score="$5" # Score
+			
+			echo "f=$f, ext=$f_ext, rating=$f_rating, playcount=$f_pcount, score=$f_score"
+			case "$f_ext" in
+				"OGG")
+					cat <<-EOF | vorbiscomment -w "$f"
+						$(vorbiscomment "$f" | grep -v '^FMPS_.*=')
+							FMPS_RATING=$f_rating
+							FMPS_PLAYCOUNT=$f_pcount
+							FMPS_RATING_AMAROK_SCORE=$f_score
+						EOF
+					;;
+				"FLAC")
+					metaflac \
+							--remove-tag=FMPS_RATING --set-tag="FMPS_RATING=$f_rating" \
+							--remove-tag=FMPS_PLAYCOUNT --set-tag="FMPS_PLAYCOUNT=$f_pcount" \
+							--remove-tag=FMPS_RATING_AMAROK_SCORE --set-tag="FMPS_RATING_AMAROK_SCORE=$f_score" \
+						"$f"
+					# For FLACs, also write ID3
+					write_fmps_meta "$f" "MP3" "$f_rating" "$f_pcount" "$f_score"
+					;;
+				"MP3")
+					eyeD3 --no-color \
+							--set-user-text-frame="FMPS_Rating:$f_rating" \
+							--set-user-text-frame="FMPS_Playcount:$f_pcount" \
+							--set-user-text-frame="FMPS_Rating_Amarok_Score:$f_score" \
+						"$f" >/dev/null
+					;;
+				*)
+					echo "E: Skipping due to an unsupported format: $f_path" >&2
+					;;
+				esac
+			}
+		
+		# Process!
+		cat "$C_filesdata" | while read f_id f_rating f_playcount f_score f_path ; do
+			((( files_current++ )))
+			declare -u f_ext
+			f_ext=${f_path##*.}
+			
+			# Exists?
+			[ ! -e "$f_path" ] && continue
+			
+			# Write metadata
+			echo "[$files_current/$files_total] $f_path (rating=$f_rating, playcount=$f_playcount, score=$f_score)"
+			write_fmps_meta "$f_path" "$f_ext" "$f_rating" "$f_playcount" "$f_score"
+			done
+		;;
+	"copy") # Copy rated files
+		[ $# -lt 1 ] && display_help
+		A_dst="$1"
+		# Copy
+		rsync -Pahvx --files-from="$C_files" / "$A_dst"
+		;;
+	"conv") # Convert files to <A_sox_format>
+		# ...Arguments
+		[ $# -lt 1 ] && display_help
+		declare -l A_sox_format
+		A_dst="$1"
+		A_sox_format="$2"
+		A_sox_quality="$3"
+		
+		# ...Defaults
+		[ -z "$A_sox_format" ] && A_sox_format="$C_sox_format"
+		[ -z "$A_sox_quality" ] && A_sox_quality="$C_sox_mp3q"
+		
+		# ...Convertion
+		files_total="$(cat "$C_files" | wc -l)"
+		files_current=0
+		
+		# ...Multi-Threading
+		NUMCPU="$(grep ^processor /proc/cpuinfo | wc -l)"
+		echo "Using $NUMCPU processes" >&2
+		function oneThread(){
+			local f_src="$1"
+			local f_dst="$2"
+			sox --multi-threaded \
+					--norm "$f_src" -C "$A_sox_quality" "$f_dst" \
+				&& [ "$A_sox_format" == "mp3" ] \
+					&& mid3iconv -q "$f_dst" \
+					&& eyeD3 --to-v2.3 "$f_dst" >/dev/null
+			}
+		
+		# Process!
+		cat "$C_files" | while read f_src ; do
+			((( files_current++ )))
+			declare -u f_ext
+			f_ext=${f_src##*.}
+			d_dst="$(dirname "$A_dst/$f_src" | FAT32PREP )"
+			f_dst="$d_dst/$(basename "${f_src%.*}.${A_sox_format}" | FAT32PREP)"
+			
+			# Exists?
+			[ ! -e "$f_src" ] && continue
+			mkdir -p "$d_dst"
+			[ -e "$f_dst" ] && continue
+			
+			# convert
+			echo "[$files_current/$files_total] $f_dst"
+			oneThread "$f_src" "$f_dst" &
+			[ `jobs -p | wc -l` -ge $NUMCPU ] && wait
+			
+			# check cover art existence, copy
+			find "$(dirname "$f_src")" -type f -iregex '.*\.\(jpg\|png\|gif\|bmp\)' -print0 | xargs -r0 -i cp -n \{\} "$d_dst/" 
+			done
+		[ `jobs -p | wc -l` -ge $NUMCPU ] && wait # wait for the rest of the jobs
+		;;
+	esac
